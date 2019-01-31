@@ -1,0 +1,143 @@
+Gerbil MIDI
+
+Gerbil MIDI is a simple way of interacting with MIDI events and files. It can
+read Standard MIDI format files.
+
+
+* Installation 
+
+#+BEGIN_SRC shell
+gxpkg install github.com/drewc/gerbil-midi
+#+END_SRC
+
+
+* Usage
+
+We'll import the package.
+
+#+NAME: import
+#+BEGIN_SRC gerbil
+  (import :drewc/midi :std/iter :gerbil/gambit)
+#+END_SRC
+
+MIDI is all about events, and their sequence delta time. Delta times are stored as ticks, and the
+header gives us the time division “Ticks Per Quarter Note”.
+
+#+NAME: ticks-per-qn
+#+BEGIN_SRC gerbil
+  (def (ticks-per-quarter-note SMF-file)
+    (SMF-file-division SMF-file))
+#+END_SRC
+
+Somewhere, before the event we are processing, is a set-tempo event, which gives
+us the number of microseconds per quarter note. We'll just use the first we find.
+
+A ~MTrk~ chunk (AKA a MIDI track) has ~MTrk-event~'s that themselves contain
+~midi-event~'s.
+
+We'll make a simple predicate to see what is what.
+
+#+NAME: pred
+#+BEGIN_SRC gerbil
+  (def (MTrk-event-event? pred)
+    (lambda (e) (pred (MTrk-event-event e))))
+#+END_SRC
+
+And use it to find the first ~set-tempo~.
+
+#+NAME: mu-per-qn
+#+BEGIN_SRC gerbil
+  (def (microseconds-per-quarter-note SMF-file)
+    (set-tempo-microseconds
+     (MTrk-event-event 
+      (find (MTrk-event-event? set-tempo?)
+           ;; A track chunk has events
+           (track-chunk-events
+            ;; which we ref as follows
+            (SMF-file-track-ref SMF-file 0))))))
+#+END_SRC
+
+Because we'll be using ~thread-sleep!~, we need it in seconds. We know how much
+time a quarter note takes, and we know how many ticks there are per quarter
+note. That means we can combine them to get the number of seconds per tick.
+Because the delta time is the number of ticks, multiplying the time per tick
+with the number of ticks gives us the delta time in seconds.
+
+#+NAME: delta-time-in-seconds 
+#+BEGIN_SRC gerbil 
+  (def (delta-time-in-seconds delta-time microseconds-per-quarter-note ticks-per-quarter-note)
+    (let* ((seconds-per-quarter-note (/ microseconds-per-quarter-note 1000000))
+           (seconds-per-tick (/ seconds-per-quarter-note ticks-per-quarter-note)))
+      (* delta-time seconds-per-tick)))
+#+END_SRC
+
+For testing, we have no way to output MIDI notes (yet!). But, there are MIDI
+files with lyrics, and we have such a file in the ~./test/sultans~ folder.
+
+
+It is a Format 0 file, which makes it simple to process in time.
+
+#+NAME: test-sequence 
+#+BEGIN_SRC gerbil
+  (def test-sequence-SMF-filename
+    "~/.gerbil/pkg/github.com/drewc/gerbil-midi/midi/test/sultans/DIRE STRAITS.Sultans of swing K.mid")
+
+#+END_SRC
+
+Putting it all together, we have a ~sleep-delta-time!~, and the console starts
+singing.
+
+#+NAME: test-sequence 
+#+BEGIN_SRC gerbil 
+  (def (test-sequence (file test-sequence-SMF-filename))
+    (def SMF-file (read-SMF-file file))
+    (def mus (microseconds-per-quarter-note SMF-file))
+    (def ticks (ticks-per-quarter-note SMF-file))
+
+    (def (sleep-delta-time! event)
+      (thread-sleep! (delta-time-in-seconds (MTrk-event-delta-time event) mus ticks))) 
+
+    ;; Now, loop over the events and sleep the required time, only outputting the
+    ;; lyrics.
+    (displayln "Introduction Instrumental... takes a while")
+    (for (e (track-chunk-events (SMF-file-track-ref SMF-file 0)))
+      (sleep-delta-time! e)
+      (when (lyric? (MTrk-event-event e))
+        (display (text-event->string (MTrk-event-event e))))))
+#+END_SRC
+
+** Try it out in a terminal! 
+
+#+BEGIN_SRC shell
+$ time gxi -e '(import :drewc/midi/test/usage)' -e '(test-sequence)'
+Introduction Instrumental... take a while
+
+You get a shiver in the dark
+It''s been raining in the park but meantime
+[ ...cut for space saving ability... ]
+We are the Sultans,
+we are the Sultans of Swing
+real    3m45.348s
+user    0m0.549s
+sys     0m0.085s
+#+END_SRC
+
+
+* Usage Files 
+
+#+BEGIN_SRC gerbil :tangle "midi/test/usage.ss" :noweb yes
+<<import>>
+
+(export test-sequence)
+
+<<ticks-per-qn>>
+
+<<pred>>
+
+<<mu-per-qn>>
+
+<<delta-time-in-seconds>>
+
+<<test-sequence>>
+#+END_SRC
+

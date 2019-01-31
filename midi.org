@@ -1,0 +1,2065 @@
+#+TITLE: Standard MIDI File Format (SMF)
+
+This lays out the implementation of Gerbil MIDI in a literate style with the
+MIDI specifications and a bunch of added information.
+
+* Introduction
+   :PROPERTIES:
+   :CUSTOM_ID: introduction
+   :END:
+
+This document details the structure of MIDI Files. The purpose of MIDI
+Files is to provide a way of interchanging time-stamped MIDI data
+between different programs on the same or different computers. One of
+the primary design goals is compact representation, which makes it very
+appropriate for disk-based file format, but which might make it
+inappropriate for storing in memory for quick access by a sequencer
+program.
+
+MIDI Files contain one or more MIDI streams, with time information for
+each event. Song, sequence, and track structures, tempo and time
+signature information, are all supported. Track names and other
+descriptive information may be stored with the MIDI data. This format
+supports multiple tracks and multiple sequences so that if the user of a
+program which supports multiple tracks intends to move a file to another
+one, this format can allow that to happen.
+
+The specification defines the 8-bit binary data stream used in the file.
+The data can be stored in a binary file, nibbilized, 7-bit-ized for
+efficient MIDI transmission, converted to Hex ASCII, or translated
+symbolically to a printable text file. This spec addresses what's in the
+ 8-bit stream. It does not address how a MIDI File will be transmitted
+over MIDI.
+
+
+** Acknowledgement:
+    :PROPERTIES:
+    :CUSTOM_ID: acknowledgement
+    :END:
+© Copyright 2019 [[mailto:me@drewc.ca][Drew Crampsie <me@drewc.ca>]]
+
+I went ahead and orgified it, gerbilized it, and changed a bunch. The original
+Acknowledgement lies below.
+
+#+BEGIN_QUOTE
+This document was originally distributed in text format by The International
+MIDI Association. I have updated it and added new Appendices.
+
+© Copyright 1999 David Back.
+ 
+EMail: [[mailto:david@csw2.co.uk][david@csw2.co.uk]] Web: [[http://www.csw2.co.uk/][http://www.csw2.co.uk]]
+
+This document may be freely copied in whole or in part provided the copy
+contains this Acknowledgement.
+#+END_QUOTE
+
+* Sequences, Tracks, Chunks: File Block Structure
+  :PROPERTIES:
+  :CUSTOM_ID: sequences-tracks-chunks-file-block-structure
+  :END:
+
+In this document, bit 0 means the least significant bit of a byte, and
+bit 7 is the most significant. 
+
+#+NAME: big-endian
+#+BEGIN_SRC gerbil
+  (def (big-endian->integer list)
+    (let loop ((list list)
+               (result 0)
+               (shift (* 8 (- (length list) 1))))
+      (if (null? list)
+        result
+        (loop (cdr list)
+              (bitwise-ior result (arithmetic-shift (car list) shift))
+              (- shift 8)))))
+
+  (def (read-big-endian-integer bytes port)
+    (let loop ((bytes bytes)
+               (result '()))
+      (if (= bytes 0)
+        (big-endian->integer (reverse result))
+        (loop (- bytes 1)
+              (cons (read-u8 port) result)))))
+
+#+END_SRC
+
+** Variable Length Quantity
+   :PROPERTIES:
+   :CUSTOM_ID: variable-length-quantity
+   :END:
+
+Some numbers in MIDI Files are represented in a form called
+VARIABLE-LENGTH QUANTITY. These numbers are represented 7 bits per byte,
+most significant bits first. All bytes except the last have bit 7 set,
+and the last byte has bit 7 clear. If the number is between 0 and 127,
+it is thus represented exactly as one byte.
+
+#+NAME: read-variable-length-quantity
+#+BEGIN_SRC gerbil
+(def (read-variable-length-quantity p)
+    (let loop ((result 0))
+      (let (byte (read-u8 p))
+        (if (eof-object? byte)
+          result
+          (let (result (bitwise-ior
+            (arithmetic-shift result 7)
+                        (##fxand byte #x7f)))
+            (if (##fx< byte #x80)
+              result
+              (loop result)))))))
+
+#+END_SRC
+
+*Some examples of numbers represented as variable-length quantities:*
+
+| 00000000   | 00            |
+| 00000040   | 40            |
+| 0000007F   | 7F            |
+| 00000080   | 81 00         |
+| 00002000   | C0 00         |
+| 00003FFF   | FF 7F         |
+| 00004000   | 81 80 00      |
+| 00100000   | C0 80 00      |
+| 001FFFFF   | FF FF 7F      |
+| 00200000   | 81 80 80 00   |
+| 08000000   | C0 80 80 00   |
+| 0FFFFFFF   | FF FF FF 7F   |
+
+The largest number which is allowed is 0FFFFFFF so that the
+variable-length representations must fit in 32 bits in a routine to
+write variable-length numbers. Theoretically, larger numbers are
+possible, but 2 x 10^{8} 96ths of a beat at a fast tempo of 500 beats
+per minute is four days, long enough for any delta-time!
+
+
+** Files
+   :PROPERTIES:
+   :CUSTOM_ID: files
+   :END:
+
+To any file system, a MIDI File is simply a series of 8-bit bytes. On
+the Macintosh, this byte stream is stored in the data fork of a file
+(with file type 'MIDI'), or on the Clipboard (with data type 'MIDI').
+Most other computers store 8-bit byte streams in files.
+
+** Chunks
+   :PROPERTIES:
+   :CUSTOM_ID: chunks
+   :END:
+
+MIDI Files are made up of -chunks-.
+
+#+NAME: chunk-struct
+#+BEGIN_SRC gerbil
+  (defstruct chunk
+    ;; type is four ascii characters
+    (type
+     ;; a 32-bit representation of a number
+     length))
+
+  (def (chunk-type->string chunk)
+    (bytes->string (chunk-type chunk)))
+#+END_SRC
+
+Each chunk has a 4-character type and a 32-bit length, which is the number of
+bytes in the chunk. 
+
+#+NAME: read-chunk-length-and-type
+#+BEGIN_SRC gerbil
+  (def (read-chunk-type port)
+    (let ((type (make-u8vector 4)))
+      (begin0 type
+        (read-u8vector type port))))
+
+  (def (read-chunk-length port)
+     (read-big-endian-integer 4 port))
+#+END_SRC
+
+This structure allows future chunk types to be designed
+which may be easily be ignored if encountered by a program written before the
+chunk type is introduced. Your programs should EXPECT alien chunks and treat
+them as if they weren't here.
+
+#+NAME: alien-chunk
+#+BEGIN_SRC gerbil
+  (defstruct (alien-chunk chunk)
+    (bytes))
+#+END_SRC
+
+Each chunk begins with a 4-character ASCII type. It is followed by a 32-bit
+length, most significant byte first (a length of 6 is stored as 00 00 00 06).
+This length refers to the number of bytes of data which follow: the eight bytes
+of type and length are not included. Therefore, a chunk with a length of 6 would
+actually occupy 14 bytes in the disk file.
+
+#+NAME: read-alien-chunk
+#+BEGIN_SRC gerbil
+  (def (read-alien-chunk type length port)
+    (let ((bytes (make-u8vector length)))
+      (read-u8vector bytes port)
+      (make-alien-chunk type length bytes)))
+#+END_SRC
+
+This chunk architecture is similar to that used by Electronic Arts' IFF
+format, and the chunks described herein could easily be placed in an IFF
+file. The MIDI File itself is not an IFF file: it contains no nested
+chunks, and chunks are not constrained to be an even number of bytes
+long. Converting it to an IFF file is as easy as padding odd length
+chunks, and sticking the whole thing inside a FORM chunk.
+
+
+** Chunk Types
+   :PROPERTIES:
+   :CUSTOM_ID: chunk-types
+   :END:
+
+MIDI Files contain two types of chunks: header chunks and track chunks.
+A -header- chunk provides a minimal amount of information pertaining to
+the entire MIDI file. A -track- chunk contains a sequential stream of
+MIDI data which may contain information for up to 16 MIDI channels. The
+concepts of multiple tracks, multiple MIDI outputs, patterns, sequences,
+and songs may all be implemented using several track chunks.
+
+A MIDI File always starts with a header chunk, and is followed by one or
+more track chunks.
+
+~MThd <length of header data> <header data>~
+~MTrk <length of track data> <track data>~
+~MTrk <length of track data> <track data>~
+
+#+NAME: read-chunk
+#+BEGIN_SRC gerbil 
+  (def (read-chunk p)
+    (let* ((type (read-chunk-type p))
+           (length (read-chunk-length p)))
+      ((cond
+        ;; "MTrk" => #u8(77 84 114 107)
+        ((equal? #u8(77 84 114 107) type) read-track-chunk)
+        ;; "MTrk" => #u8(77 84 114 107)
+       ((equal? #u8(77 84 104 100) type) read-header-chunk)
+       (else read-alien-chunk))
+       type length p)))
+
+
+  (def (read-chunks p)
+    (let ((chunk (read-chunk p))
+          (next (peek-u8 p)))
+      (if (eof-object? next)
+        [chunk]
+        (cons chunk (read-chunks p)))))
+#+END_SRC
+
+* Chunk Descriptions
+  :PROPERTIES:
+  :CUSTOM_ID: chunk-descriptions
+  :END:
+
+  
+** Header Chunks
+   :PROPERTIES:
+   :CUSTOM_ID: header-chunks
+   :END:
+
+The header chunk at the beginning of the file specifies some basic
+information about the data in the file. Here's the syntax of the
+chcomplete chunk:
+
+#+BEGIN_SRC bnf
+<Header Chunk> = <chunk type><length><format><ntrks><division>
+#+END_SRC
+
+#+NAME: header-chunk
+#+BEGIN_SRC gerbil
+  (defstruct (header-chunk chunk)
+     (format number-of-tracks division)) 
+#+END_SRC
+
+As described above, <chunk type> is the four ASCII characters 'MThd';
+<length> is a 32-bit representation of the number 6 (high byte first).
+
+The data section contains three 16-bit words, stored most-significant
+byte first.
+
+The first word, <format>, specifies the overall organisation of the
+file. Only three values of <format> are specified:
+
+0-the file contains a single multi-channel track\\
+1-the file contains one or more simultaneous tracks (or MIDI outputs) of
+a sequence\\
+2-the file contains one or more sequentially independent single-track
+patterns
+
+More information about these formats is provided below.
+
+The next word, <ntrks>, is the number of track chunks in the file. It
+will always be 1 for a format 0 file.
+
+The third word, <division>, specifies the meaning of the delta-times. It
+has two formats, one for metrical time, and one for time-code-based
+time:
+
++--------+------------------------+-----------------+
+| bit 15 | bits 14 thru 8         | bits 7 thru 0   |
++--------+------------------------+-----------------+
+|      0 | ticks per quarter-note                   |
++--------+------------------------+-----------------+
+|      1 | negative SMPTE format  | ticks per frame |
++--------+------------------------+-----------------+
+
+If bit 15 of <division> is zero, the bits 14 thru 0 represent the number
+of delta time "ticks" which make up a quarter-note. For instance, if
+division is 96, then a time interval of an eighth-note between two
+events in the file would be 48.
+
+If bit 15 of <division> is a one, delta 48times in a file correspond to
+subdivisions of a second, in a way consistent with SMPTE and MIDI Time
+ode. Bits 14 thru 8 contain one of the four values -24, -25, -29, or
+-30, corresponding to the four standard SMPTE and MIDI Time Code formats
+(-29 corresponds to 30 drop frame), and represents the number of frames
+per second. These negative numbers are stored in two's compliment form.
+The second byte (stored positive) is the resolution within a frame:
+typical values may be 4 (MIDI Time Code resolution), 8, 10, 80 (bit
+resolution), or 100. This stream allows exact specifications of
+time-code-based tracks, but also allows millisecond-based tracks by
+specifying 25 frames/sec and a resolution of 40 units per frame. If the
+events in a file are stored with a bit resolution of thirty-frame time
+code, the division word would be E250 hex.
+
+
+#+NAME: read-header-chunk
+#+BEGIN_SRC gerbil
+  (def (read-header-chunk type length p)
+    (let* ((format (read-big-endian-integer 2 p))
+           (number-of-tracks (read-big-endian-integer 2 p))
+           (division (read-big-endian-integer 2 p)))
+      ;; Also, more parameters may be added to the MThd chunk in the future: it is
+      ;; important to read and honour the length, even if it is longer than 6.
+      ;; We'll throw any extras away.
+      (when (> length 6)
+        (for ((x (in-range (- length 6))))
+          (read-u8 p)))
+      (make-header-chunk type length format number-of-tracks division)))
+
+#+END_SRC
+
+** MIDI File Formats 0,1 and 2
+   :PROPERTIES:
+   :CUSTOM_ID: midi-file-formats-01-and-2
+   :END:
+
+#+NAME: midi-file-struct
+#+BEGIN_SRC gerbil
+  (defstruct SMF-file 
+    (;; a single chunk
+     header
+     ;; a list of chunks
+     tracks))
+
+  (def (read-SMF-file from)
+    (if (port? from)
+      (let ((header (read-chunk from))
+            (tracks (read-chunks from)))
+        (make-SMF-file header tracks))
+      (call-with-input-file from read-SMF-file)))
+
+  (def (SMF-file-track-ref file n)
+    (list-ref (SMF-file-tracks file) n))
+
+#+END_SRC
+
+A Format 0 file has a header chunk followed by one track chunk. It is
+the most interchangeable representation of data. It is very useful for a
+simple single-track player in a program which needs to make synthesisers
+make sounds, but which is primarily concerned with something else such
+as mixers or sound effect boxes. It is very desirable to be able to
+produce such a format, even if your program is track-based, in order to
+work with these simple programs.
+
+A Format 1 or 2 file has a header chunk followed by one or more track
+chunks. programs which support several simultaneous tracks should be
+able to save and read data in format 1, a vertically one dimensional
+form, that is, as a collection of tracks. Programs which support several
+independent patterns should be able to save and read data in format 2, a
+horizontally one dimensional form. Providing these minimum capabilities
+will ensure maximum interchangeability.
+
+#+NAME: midi-file-struct
+#+BEGIN_SRC gerbil
+  (def (SMF-file-format SMF-file)
+      (header-chunk-format (SMF-file-header SMF-file)))
+  (def (SMF-file-number-of-tracks SMF-file)
+      (header-chunk-number-of-tracks (SMF-file-header SMF-file)))
+  (def (SMF-file-division SMF-file)
+      (header-chunk-division (SMF-file-header SMF-file)))
+
+#+END_SRC
+
+In a MIDI system with a computer and a SMPTE synchroniser which uses
+Song Pointer and Timing Clock, tempo maps (which describe the tempo
+throughout the track, and may also include time signature information,
+so that the bar number may be derived) are generally created on the
+computer. To use them with the synchroniser, it is necessary to transfer
+them from the computer. To make it easy for the synchroniser to extract
+this data from a MIDI File, tempo information should always be stored in
+the first MTrk chunk. For a format 0 file, the tempo will be scattered
+through the track and the tempo map reader should ignore the intervening
+events; for a format 1 file, the tempo map must be stored as the first
+track. It is polite to a tempo map reader to offer your user the ability
+to make a format 0 file with just the tempo, unless you can use format
+1.
+
+#+NAME: midi-file-struct
+#+BEGIN_SRC gerbil
+  (def (SMF-file-tempo-map SMF-file)
+    (case (SMF-file-format SMF-file)
+      ((0 1) 
+       (for/collect ((e (track-chunk-events (SMF-file-track-ref SMF-file 0))
+                        when (let ((ee (MTrk-event-event e)))
+                               (or (set-tempo? ee) (time-signature? ee)))))
+         e))))
+#+END_SRC
+
+All MIDI Files should specify tempo and time signature. If they don't,
+the time signature is assumed to be 4/4, and the tempo 120 beats per
+minute. In format 0, these meta-events should occur at least at the
+beginning of the single multi-channel track. In format 1, these
+meta-events should be contained in the first track. In format 2, each of
+the temporally independent patterns should contain at least initial time
+signature and tempo information.
+
+Format IDs to support other structures may be defined in the future. A
+program encountering an unknown format ID may still read other MTrk
+chunks it finds from the file, as format 1 or 2, if its user can make
+sense of them and arrange them into some other structure if appropriate.
+Also, more parameters may be added to the MThd chunk in the future: it
+is important to read and honour the length, even if it is longer than 6.
+
+#+NAME: midi-status-byte?
+** Track Chunks
+   :PROPERTIES:
+   :CUSTOM_ID: track-chunks
+   :END:
+
+The track chunks (type MTrk) are where actual song data is stored. Each
+track chunk is simply a stream of MIDI events (and non-MIDI events),
+preceded by delta-time values. The format for Track Chunkts (described
+below) is exactly the same for all three formats (0, 1, and 2: see
+"Header Chunk" above) of MIDI Files.
+
+Here is the syntax of an MTrk chunk (the + means "one or more": at least
+one MTrk event must be present):
+
+#+BEGIN_SRC bnf
+<Track Chunk> = <chunk type><length><MTrk event>+
+#+END_SRC
+
+#+NAME: track-chunk
+#+BEGIN_SRC gerbil
+  (defstruct (track-chunk chunk)
+    (events))
+#+END_SRC
+
+#+NAME: read-track-chunk
+#+BEGIN_SRC gerbil
+  (def (read-track-chunk type length p)
+    (let (events (read-MTrk-events p))
+      (make-track-chunk type length events)))
+#+END_SRC
+
+* MTrk event 
+
+The syntax of an MTrk event is very simple:
+
+<MTrk event> = <delta-time><event>
+
+#+NAME: MTrk-event
+#+BEGIN_SRC gerbil
+  (defstruct MTrk-event
+    (delta-time event))
+#+END_SRC
+
+#+NAME: read-MTrk-events
+#+BEGIN_SRC gerbil
+
+  ;; HACK: If there's ever an invalid-event in our midi file, which hopefully
+  ;; never occurs but during hacking does until I make it valid, we cannot tell
+  ;; the delta-time.
+
+  ;; So, we'll pass one over, and keep on reading.
+
+  (def (read-MTrk-event p (delta-time #f))
+   (let ((delta-time (or delta-time (read-delta-time p)))
+         (event (read-event p)))
+     (make-MTrk-event delta-time event)))
+
+  (def (read-MTrk-events p (delta-time #f))
+    (def (%read delta-time)
+      (let* ((MTrk-event (read-MTrk-event p delta-time))
+             (event (MTrk-event-event MTrk-event)))
+        (if (end-of-track? event)
+          [MTrk-event]
+          (cons MTrk-event
+                (%read (if (invalid-event? event)
+                           (MTrk-event-delta-time event)
+                           #f))))))
+    (parameterize ((current-running-status (current-running-status)))
+      (%read delta-time)))
+#+END_SRC
+
+#+BEGIN_SRC gerbil
+  (defmethod {print MTrk-event}
+    (lambda (self)
+      (printf "MTrk Time: ~A, ~A"
+              (MTrk-delta-time self)
+              (with-output-to-string
+                "" (lambda () {print (MTrk-event self)})))))
+#+END_SRC
+
+<delta-time> is stored as a variable-length quantity. It represents the
+amount of time before the following event. If the first event in a track
+occurs at the very beginning of a track, or if two events occur
+simultaneously, a delta-time of zero is used. Delta-times are always
+present. (Not storing delta-times of 0 requires at least two bytes for
+any other value, and most delta-times aren't zero.) Delta-time is in
+some fraction of a beat (or a second, for recording a track with SMPTE
+times), as specified in the header chunk.
+
+#+NAME: read-delta-time 
+#+BEGIN_SRC gerbil
+  (def (read-delta-time p)
+    (read-variable-length-quantity p))
+#+END_SRC
+
+
+* <event>'s 
+
+ There are three main types of event that can occur within a MTrk chunk - MIDI,
+ SysEx and Meta. Events are not all the same size - they use as many bytes as are
+ necessary to describe each specific event.
+
+#+BEGIN_SRC bnf
+ <event> = <MIDI event> | <sysex event> | <meta-event>
+#+END_SRC
+
+#+NAME:event-struct
+#+BEGIN_SRC gerbil 
+  (defstruct event 
+   (status-byte))
+#+END_SRC
+ 
+ The first byte of the event data (often referred to as the event's status byte,
+ and identifiable by their having bit 7 set) identifies the event type.
+
+#+NAME: status-byte?
+ #+BEGIN_SRC gerbil
+   (def (status-byte? byte)
+     (<= #x80 byte))
+ #+END_SRC
+
+#+NAME: read-event
+#+BEGIN_SRC gerbil
+
+
+  (def (read-event p)
+    (let* ((potential-status (peek-u8 p))
+           (status-byte
+            ;;If the first (status) byte is less than 128 (hex 80), this implies
+            ;;that running status is in effect, and that this byte is actually the
+            ;;first data byte (the status carrying over from the previous MIDI
+            ;;event).
+            (if (not (status-byte? potential-status))
+              (current-running-status)
+              ;; This can only be the case if the immediately previous event was
+              ;; also a MIDI event, i.e. SysEx and Meta events interrupt (clear)
+              ;; running status.
+              (let ((byte (read-u8 p)))
+                (begin0 byte
+                  (new-current-running-status! byte))))))
+      (cond 
+       ;; First midi
+       ((midi-status-byte? status-byte)
+
+        (read-midi-event status-byte p))
+       ;; Now META
+       ((= status-byte #xff)
+        (read-meta-event status-byte p))
+       ;; Sysex
+       ((or (= status-byte #xF0)
+            (= status-byte #xF7))
+        (read-sysex-event status-byte p))
+       ;; Else
+       (else 
+        (read-invalid-event status-byte p)))))
+#+END_SRC
+ 
+** Midi events (status bytes 0x8n - 0xEn)
+   :PROPERTIES:
+   :CUSTOM_ID: all-midi-events
+   :END:
+
+  Midi events (status bytes 0x8n - 0xEn) Corresponding to the standard Channel
+  MIDI messages, i.e. where 'n' is the MIDI channel (0 - 15). This status byte
+  will be followed by 1 or 2 data bytes, as is usual for the particular MIDI
+  message. Any valid Channel MIDI message can be included in a MIDI file.
+
+#+NAME: midi-status-byte?
+ #+BEGIN_SRC gerbil
+ (def (midi-status-byte? byte)
+   (and (<= #x80 byte) (<= byte #xEF)))
+ #+END_SRC
+
+  If the first (status) byte is less than 128 (hex 80), this implies that running
+  status is in effect, and that this byte is actually the first data byte (the
+  status carrying over from the previous MIDI event). This can only be the case
+  if the immediately previous event was also a MIDI event, i.e. SysEx and Meta
+  events interrupt (clear) running status.
+
+
+ #+NAME: current-running-status
+ #+BEGIN_SRC gerbil 
+   (def current-running-status
+     (make-parameter #f))
+  #+END_SRC
+  
+ <MIDI event> is any MIDI channel message.
+
+#+NAME: midi-event-table
+| *Hex* | *Binary* | *Data*  | *Description*                                     |      |                                    |   |
+|-------+----------+---------+---------------------------------------------------+------+------------------------------------+---|
+| 8x    | 1000xxxx | /nn vv/ | Note off (key is released)                        |      |                                    |   |
+|       |          |         |                                                   | /nn/ | note number                        |   |
+|       |          |         |                                                   | /vv/ | velocity                           |   |
+| 9x    | 1001xxxx | /nn vv/ | Note on (key is pressed)                          |      |                                    |   |
+|       |          |         |                                                   | /nn/ | note number                        |   |
+|       |          |         |                                                   | /vv/ | velocity                           |   |
+| Ax    | 1010xxxx | /nn vv/ | Key after-touch                                   |      |                                    |   |
+|       |          |         |                                                   | /nn/ | note number                        |   |
+|       |          |         |                                                   | /vv/ | velocity                           |   |
+| Bx    | 1011xxxx | /cc vv/ | Control Change                                    |      |                                    |   |
+|       |          |         |                                                   | /cc/ | controller number                  |   |
+|       |          |         |                                                   | /vv/ | new value                          |   |
+| Cx    | 1100xxxx | /pp/    | Program (patch) change                            |      |                                    |   |
+|       |          |         |                                                   | /pp/ | new program number                 |   |
+| Dx    | 1101xxxx | /cc/    | Channel after-touch                               |      |                                    |   |
+|       |          |         |                                                   | /cc/ | channel number                     |   |
+| Ex    | 1110xxxx | /bb tt/ | Pitch wheel change (2000H is normal or no change) |      |                                    |   |
+|       |          |         |                                                   | /bb/ | bottom (least sig) 7 bits of value |   |
+|       |          |         |                                                   | /tt/ | top (most sig) 7 bits of value     |   |
+|-------+----------+---------+---------------------------------------------------+------+------------------------------------+---|
+
+
+
+#+NAME: midi-events
+#+BEGIN_SRC gerbil
+  (defstruct (midi-event event) ())
+
+  (def (midi-event-status midi-event)
+    (bitwise-and (event-status-byte midi-event) #xF0))
+
+  (def (midi-event-channel midi-event)
+    (bitwise-and (event-status-byte midi-event) #x0F))
+
+  (defstruct (note-off midi-event)
+    (number velocity))
+  (defstruct (note-on midi-event)
+    (number velocity))
+  (defstruct (key-aftertouch midi-event)
+    (note velocity))
+  (defstruct (control-change midi-event)
+    (controller value))
+  (defstruct (program-change midi-event)
+    (number))
+  (defstruct (channel-aftertouch midi-event)
+    (number))
+  (defstruct (pitchwheel-change midi-event)
+    (bottom top))
+#+END_SRC
+
+#+NAME: read-midi-event
+#+BEGIN_SRC gerbil
+  (def (read-midi-event status-byte p)
+    (def (two-bytes maker)
+      (let* ((one (read-u8 p)) (two (read-u8 p)))
+        (maker status-byte one two)))
+    (case  (bitwise-and status-byte #xF0)
+      ;; | 8x    | 1000xxxx | /nn vv/ | Note off (key is released)      
+      ((#x80) (two-bytes make-note-off))
+      ;; | 9x    | 1001xxxx | /nn vv/ | Note on (key is pressed)   
+      ((#x90) (two-bytes make-note-on))
+      ;; | Ax    | 1010xxxx | /nn vv/ | Key after-touch
+      ((#xA0) (two-bytes make-key-aftertouch))
+      ;; | Bx    | 1011xxxx | /cc vv/ | Control Change
+      ((#xB0) (two-bytes make-control-change))
+      ;; | Cx    | 1100xxxx | /pp/    | Program (patch) change
+      ((#xC0) (make-program-change status-byte (read-u8 p)))
+      ;; | Dx    | 1101xxxx | /cc/    | Channel after-touch
+      ((#xD0) (make-channel-aftertouch status-byte (read-u8 p)))
+      ;; | Ex    | 1110xxxx | /bb tt/ | Pitch wheel change (2000H is normal or no change)
+      ((#xE0) (two-bytes make-pitchwheel-change))
+      ;; ELSE no soup for you!
+      (else (error (format "Not a known midi event: #x~X" status-byte)))))
+#+END_SRC
+
+** SysEx events (status bytes 0xF0 and 0xF7) 
+
+   There are a couple of ways in which system exclusive messages can be encoded -
+   as a single message (using the 0xF0 status), or split into packets (using the
+   0xF7 status). The 0xF7 status is also used for sending escape sequences.
+
+ <sysex event> is used to specify a MIDI system exclusive message, either as one
+ unit or in packets, or as an "escape" to specify any arbitrary bytes to be
+ transmitted. A normal complete system exclusive message is stored in a MIDI File
+ in this way:
+
+ #+BEGIN_SRC bnf
+ F0 <length> <bytes to be transmitted after F0>
+ #+END_SRC
+
+ The length is stored as a variable-length quantity. It specifies the
+ number of bytes which follow it, not including the F0 or the length
+ itself. For instance, the transmitted message F0 43 12 00 07 F7 would be
+ stored in a MIDI File as F0 05 43 12 00 07 F7. It is required to include
+ the F7 at the end so that the reader of the MIDI File knows that it has
+ read the entire message.
+
+ Another form of sysex event is provided which does not imply that an F0
+ should be transmitted. This may be used as an "escape" to provide for
+ the transmission of things which would not otherwise be legal, including
+ system realtime messages, song pointer or select, MIDI Time Code, etc.
+ This uses the F7 code:
+
+ #+BEGIN_SRC bnf
+ F7 <length> <all bytes to be transmitted>
+ #+END_SRC
+
+ #+NAME: sysex-event
+ #+BEGIN_SRC gerbil
+   (defstruct (sysex-event event)
+    (bytes))
+
+   (def (sysex-event-length sysex-event)
+     (u8vector-length bytes))
+ #+END_SRC
+
+ #+NAME: read-sysex-event
+ #+BEGIN_SRC gerbil
+   (def (read-sysex-event status-byte p)
+     (let* ((length (read-variable-length-quantity p))
+            (bytes (make-u8vector length)))
+       (read-u8vector bytes p)
+       (make-sysex-event status-byte bytes)))
+
+ #+END_SRC
+ Unfortunately, some synthesiser manufacturers specify that their system
+ exclusive messages are to be transmitted as little packets. Each packet
+ is only part of an entire syntactical system exclusive message, but the
+ times they are transmitted are important. Examples of this are the bytes
+ sent in a CZ patch dump, or the FB-01's "system exclusive mode" in which
+ microtonal data can be transmitted. The F0 and F7 sysex events may be
+ used together to break up syntactically complete system exclusive
+ messages into timed packets.
+
+ An F0 sysex event is used for the first packet in a series -- it is a
+ message in which the F0 should be transmitted. An F7 sysex event is used
+ for the remainder of the packets, which do not begin with F0. (Of
+ course, the F7 is not considered part of the system exclusive message).
+
+ A syntactic system exclusive message must always end with an F7, even if
+ the real-life device didn't send one, so that you know when you've
+ reached the end of an entire sysex message without looking ahead to the
+ next event in the MIDI File. If it's stored in one complete F0 sysex
+ event, the last byte must be an F7. There also must not be any
+ transmittable MIDI events in between the packets of a multi-packet
+ system exclusive message. This principle is illustrated in the paragraph
+ below.
+
+ Here is a MIDI File of a multi-packet system exclusive message: suppose
+ the bytes F0 43 12 00 were to be sent, followed by a 200-tick delay,
+ followed by the bytes 43 12 00 43 12 00, followed by a 100-tick delay,
+ followed by the bytes 43 12 00 F7, this would be in the MIDI File:
+
+ | F0 03 43 12 00            |                       |
+ | 81 48                     | 200-tick delta time   |
+ | F7 06 43 12 00 43 12 00   |                       |
+ | 64                        | 100-tick delta time   |
+ | F7 04 43 12 00 F7         |                       |
+
+ When reading a MIDI File, and an F7 sysex event is encountered without a
+ preceding F0 sysex event to start a multi-packet system exclusive
+ message sequence, it should be presumed that the F7 event is being used
+ as an "escape". In this case, it is not necessary that it end with an
+ F7, unless it is desired that the F7 be transmitted.
+
+  
+** Meta events (status byte 0xFF)
+  
+ These contain additional information which would not be in the MIDI data
+stream itself. E.g. TimeSig, KeySig, Tempo, TrackName, Text, Marker, Special,
+EOT (End of Track) events being some of the most common.
+
+  <meta-event> specifies non-MIDI information useful to this format or to
+  sequencers, with this syntax:
+
+ #+BEGIN_SRC bnf
+ FF <type> <length> <bytes>
+ #+END_SRC
+
+ #+NAME: meta-event
+ #+BEGIN_SRC gerbil
+   (defstruct (meta-event event)
+     (type bytes))
+
+   (def (meta-event-length meta-event)
+     (u8vector-length (meta-event-bytes meta-event)))
+
+
+   ;; This is simple.
+   ;; (def-event-bytes foo bar baz) => (def (foo-bar foo) (u8vector-ref foo 0))
+   ;; Same thing for set!
+
+   (defsyntax (def-meta-event-bytes stx)
+     (def (%def-event-bytes name args)
+     (cons 'begin  
+           (for/fold (d []) (n (in-range (length args)))
+             (cons* `(def (,(string->symbol (format "~A-~A" name (list-ref args n))) ,name)
+                       (u8vector-ref (meta-event-bytes ,name) ,n))
+                    `(def (,(string->symbol (format "~A-~A-set!" name (list-ref args n))) ,name val)
+                       (u8vector-set! (meta-event-bytes ,name) ,n val))
+                    d))))
+     (syntax-case stx ()
+       ((macro name . args)
+        (let* ((n (syntax->datum #'name))
+               (bs (syntax->datum #'args))
+               (new-beginning (%def-event-bytes n bs)))
+          (with-syntax ((begin-event (datum->syntax #'macro new-beginning)))
+            #'begin-event))))) 
+ #+END_SRC
+
+ All meta-events begin with FF, then have an event type byte (which is
+ always less than 128), and then have the length of the data stored as a
+ variable-length quantity, and then the data itself. If there is no data,
+ the length is 0. As with chunks, future meta-events may be designed
+ which may not be known to existing programs, so programs must properly
+ ignore meta-events which they do not recognise, and indeed should expect
+ to see them. 
+
+#+NAME: unknown-meta-event
+#+BEGIN_SRC gerbil
+ (defstruct (unknown-meta-event meta-event) ())
+#+END_SRC
+
+ Programs must never ignore the length of a meta-event which
+ they do not recognise, and they shouldn't be surprised if it's bigger
+ than expected. If so, they must ignore everything past what they know
+ about. However, they must not add anything of their own to the end of
+ the meta- event. 
+
+ #+NAME: read-meta-event
+ #+BEGIN_SRC gerbil
+   (def (read-meta-event status-byte p)
+     (let* ((type (read-u8 p))
+            (length (read-variable-length-quantity p))
+            (bytes (make-u8vector length)))
+       (read-u8vector bytes p)
+       ((case type 
+          ;;Meta-event types 01 through 0F are reserved for various types of text
+          ;;events, each of which meets the specification of text events:
+
+          ;; #xFF type length text
+
+          ((#x01 #x02 #x03 #x04 #x05 #x06 #x07 #x08
+                 #x09 #x0A #x0B #x0C #x0D #x0E #x0F)
+           construct-text-event)
+          ((#x7F) make-sequencer-specific)
+          ((#x2f) make-end-of-track)
+          ((#x51) make-set-tempo)
+          ((#x58) make-time-signature)
+          ((#x59) make-key-signature)
+        (else make-unknown-meta-event)) 
+        status-byte type bytes)))
+
+ #+END_SRC
+
+ Sysex events and meta events cancel any running status
+ which was in effect. Running status does not apply to and may not be
+ used for these messages.
+
+ #+NAME: current-running-status
+ #+BEGIN_SRC gerbil 
+   (def (new-current-running-status! byte)
+     (current-running-status
+      (if (midi-status-byte? byte) byte #f)))
+  #+END_SRC
+ 
+*** Known Meta-Events
+    :PROPERTIES:
+    :CUSTOM_ID: meta-events
+    :END:
+
+ A few meta-events are defined herein. It is not required for every
+ program to support every meta-event.
+
+ In the syntax descriptions for each of the meta-events a set of
+ conventions is used to describe parameters of the events. The FF which
+ begins each event, the type of each event, and the lengths of events
+ which do not have a variable amount of data are given directly in
+ hexadecimal. A notation such as dd or se, which consists of two
+ lower-case letters, mnemonically represents an 8-bit value. Four
+ identical lower-case letters such as wwww mnemonically refer to a 16-bit
+ value, stored most-significant-byte first. Six identical lower-case
+ letters such as tttttt refer to a 24-bit value, stored
+ most-significant-byte first. The notation len refers to the length
+ portion of the meta-event syntax, that is, a number, stored as a
+ variable- length quantity, which specifies how many bytes (possibly
+ text) data were just specified by the length.
+
+ In general, meta-events in a track which occur at the same time may
+ occur in any order. If a copyright event is used, it should be placed as
+ early as possible in the file, so it will be noticed easily. Sequence
+ Number and Sequence/Track Name events, if present, must appear at time
+ 0. An end-of- track event must occur as the last event in the track.
+
+
+**** *FF 00 02 Sequence Number*
+ This optional event, which must occur at the beginning of a track,
+ before any nonzero delta-times, and before any transmittable MIDI
+ events, specifies the number of a sequence. In a format 2 MIDI File, it
+ is used to identify each "pattern" so that a "song" sequence using the
+ Cue message can refer to the patterns. If the ID numbers are omitted,
+ the sequences' locations in order in the file are used as defaults. In a
+ format 0 or 1 MIDI File, which only contain one sequence, this number
+ should be contained in the first (or only) track. If transfer of several
+ multitrack sequences is required, this must be done as a group of format
+ 1 files, each with a different sequence number.
+
+**** ~01 through 0F~ Text Events
+
+     #+BEGIN_QUOTE
+    Meta-event types 01 through 0F are reserved for various types of text
+    events, each of which meets the specification of text events.
+     #+END_QUOTE
+
+***** ~01~ Text Event
+
+  *FF 01 len text Text Event*
+
+ #+NAME: text-meta-event
+ #+BEGIN_SRC gerbil
+   (defstruct (text-event meta-event) ())
+
+   (def (text-event->string meta-event)
+     (bytes->string (meta-event-bytes meta-event)))
+
+ #+END_SRC
+     
+  Any amount of text describing anything. It is a good idea to put a text
+  event right at the beginning of a track, with the name of the track, a
+  description of its intended orchestration, and any other information
+  which the user wants to put there. Text events may also occur at other
+  times in a track, to be used as lyrics, or descriptions of cue points.
+  The text in this event should be printable ASCII characters for maximum
+  interchange. However, other character codes using the high-order bit may
+  be used for interchange of files between different programs on the same
+  computer which supports an extended character set. Programs on a
+  computer which does not support non-ASCII characters should ignore those
+  characters.
+
+  Meta-event types 01 through 0F are reserved for various types of text
+  events, each of which meets the specification of text events (above) but
+  is used for a different purpose.
+
+
+ #+NAME: text-meta-event
+ #+BEGIN_SRC gerbil
+   (def text-events
+       [[01 . "Text"]
+        [02 . "Copyright Notice"]
+        [03 . "Sequence/Track Name"]
+        [04 . "Instrument Name"]
+        [05 . "Lyric"]
+        [06 . "Marker"]
+        [07 . "Cue Point"]])
+
+   (def (text-event-description text-event)
+     (let ((string (assoc (meta-event-type text-event) text-events eqv?)))
+       (if string (cdr string) (number->string (meta-event-type text-event)))))
+
+   (defstruct (unknown-text-event text-event) ())
+
+   (def (construct-text-event FF type bytes)
+    ((case type
+       ((#x01) make-text-event)
+       ((#x03) make-track-name)
+       ((#x05) make-lyric)
+       (else make-unknown-text-event))
+     FF type bytes))
+ #+END_SRC
+
+   
+***** ~02~ Copyright Notice
+
+  *FF 02 len text Copyright Notice*
+  
+  Contains a copyright notice as printable ASCII text. The notice should
+  contain the characters (C), the year of the copyright, and the owner of the
+  copyright. If several pieces of music are in the same MIDI File, all of the
+  copyright notices should be placed together in this event so that it will
+  be at the beginning of the file. This event should be the first event in
+  the track chunk, at time 0.
+
+    
+***** ~03~ Sequence/Track Name
+
+       *FF 03 len text Sequence/Track Name*
+     
+  If in a format 0 track, or the first track in a format 1 file, the name
+  of the sequence. Otherwise, the name of the track.
+
+  #+NAME: track-name-meta-event
+  #+BEGIN_SRC gerbil
+   (defstruct (track-name text-event) ())
+  #+END_SRC
+  
+  #+NAME: SMF-file-sequence-name 
+  #+BEGIN_SRC gerbil
+    (def (SMF-file-sequence-name SMF-file)
+      (track-chunk-track-name (SMF-file-track-ref SMF-file 0)))
+  #+END_SRC
+  
+  #+NAME: track-chunk-track-name 
+  #+BEGIN_SRC gerbil
+    (def (track-chunk-track-name track-chunk)
+      (let (e (find (lambda (e) (track-name? (MTrk-event-event e)))
+                    (track-chunk-events track-chunk)))
+        (if e
+          (text-event->string (MTrk-event-event e))
+          #f)))
+  #+END_SRC
+
+ 
+***** TODO *FF 04 len text Instrument Name*\\
+  A description of the type of instrumentation to be used in that track.
+  May be used with the MIDI Prefix meta-event to specify which MIDI
+  channel the description applies to, or the channel may be specified as
+  text in the event itself.
+
+***** ~05~ Lyric
+  *FF 05 len text Lyric*
+  A lyric to be sung. Generally, each syllable will be a separate lyric
+  event which begins at the event's time.
+#+NAME: lyric-meta-event
+  #+BEGIN_SRC gerbil
+(defstruct (lyric text-event) ())
+  #+END_SRC
+  
+***** TODO *FF 06 len text Marker*\\
+  Normally in a format 0 track, or the first track in a format 1 file. The
+  name of that point in the sequence, such as a rehearsal letter or
+  section name ("First Verse", etc.)
+
+***** TODO *FF 07 len text Cue Point*\\
+  A description of something happening on a film or video screen or stage
+  at that point in the musical score ("Car crashes into house", "curtain
+  opens", "she slaps his face", etc.)
+
+
+
+**** *FF 20 01 cc MIDI Channel Prefix*
+The MIDI channel (0-15) contained in this event may be used to associate
+a MIDI channel with all events which follow, including System exclusive
+and meta-events. This channel is "effective" until the next normal MIDI
+event (which contains a channel) or the next MIDI Channel Prefix
+meta-event. If MIDI channels refer to "tracks", this message may be put
+into a format 0 file, keeping their non-MIDI data associated with a
+track. This capability is also present in Yamaha's ESEQ file format.
+
+**** ~2F~ End of Track
+
+ *FF 2F 00 End of Track*
+ 
+This event is not optional. It is included so that an exact ending point
+may be specified for the track, so that an exact length is defined,
+which is necessary for tracks which are looped or concatenated.
+
+ #+NAME: end-of-track-meta-event
+ #+BEGIN_SRC gerbil
+   (defstruct (end-of-track meta-event) ())
+ #+END_SRC
+
+**** ~51~ Set Tempo (in microseconds per MIDI quarter-note)
+
+*FF 51 03 tttttt Set Tempo (in microseconds per MIDI quarter-note)*
+
+ This event indicates a tempo change. Another way of putting
+ "microseconds per quarter-note" is "24ths of a microsecond per MIDI
+ clock". Representing tempos as time per beat instead of beat per time
+ allows absolutely exact long-term synchronisation with a time-based sync
+ protocol such as SMPTE time code or MIDI time code. The amount of
+ accuracy provided by this tempo resolution allows a four-minute piece at
+ 120 beats per minute to be accurate within 500 usec at the end of the
+ piece. Ideally, these events should only occur where MIDI clocks would
+ be located -- this convention is intended to guarantee, or at least
+ increase the likelihood, of compatibility with other synchronisation
+ devices so that a time signature/tempo map stored in this format may
+ easily be transferred to another device.
+ 
+#+NAME: set-tempo-meta-event
+ #+BEGIN_SRC gerbil
+  (defstruct (set-tempo meta-event) ())
+
+  (def (set-tempo-microseconds meta-event)
+    (def (big-endian->integer list)
+      (let loop ((list list)
+                 (result 0)
+                 (shift (* 8 (- (length list) 1))))
+        (if (null? list)
+          result
+          (loop (cdr list)
+                (bitwise-ior result (arithmetic-shift (car list) shift))
+                (- shift 8)))))
+    (big-endian->integer
+     (u8vector->list (meta-event-bytes meta-event))))
+ #+END_SRC
+
+
+**** *FF 54 05 hr mn se fr ff SMPTE Offset*
+This event, if present, designates the SMPTE time at which the track
+chunk is supposed to start. It should be present at the beginning of the
+track, that is, before any nonzero delta-times, and before any
+transmittable MIDI events. the hour must be encoded with the SMPTE
+format, just as it is in MIDI Time Code. In a format 1 file, the SMPTE
+Offset must be stored with the tempo map, and has no meaning in any of
+the other tracks. The ff field contains fractional frames, in 100ths of
+a frame, even in SMPTE-based tracks which specify a different frame
+subdivision for delta-times.
+
+
+**** ~58~ Time Signature*
+
+*FF 58 04 nn dd cc bb Time Signature*
+
+The time signature is expressed as four numbers. nn and dd represent the
+numerator and denominator of the time signature as it would be notated.
+The denominator is a negative power of two: 2 represents a quarter-note,
+3 represents an  eighth-note, etc. The cc parameter expresses the number
+of MIDI clocks in a metronome click. The bb parameter expresses the
+number of notated 32nd-notes in a MIDI quarter-note (24 MIDI clocks).
+This was added because there are already multiple programs which allow a
+user to specify that what MIDI thinks of as a quarter-note (24 clocks)
+is to be notated as, or related to in terms of, something else.
+
+#+NAME: time-signature-meta-event
+#+BEGIN_SRC gerbil
+  (defstruct (time-signature meta-event) ())
+
+  (def-meta-event-bytes time-signature
+    numerator denominator pulses-per-quarter 32nd-per-click)
+
+  (def (time-signature-beats time-signature)
+    (time-signature-numerator time-signature))
+
+  (def (time-signature-bars time-signature)
+    (denominator (expt 2 (* (time-signature-denominator time-signature) -1))))
+#+END_SRC
+
+Therefore, the complete event for 6/8 time, where the metronome clicks
+every three eighth-notes, but there are 24 clocks per quarter-note, 72
+to the bar, would be (in hex):
+
+FF 58 04 06 03 24 08
+
+That is, 6/8 time (8 is 2 to the 3rd power, so this is 06 03), 36 MIDI
+clocks per dotted-quarter (24 hex!), and eight notated 32nd-notes per
+quarter-note.
+
+
+
+**** ~59~  sf mi Key Signature*
+
+#+NAME: key-signature-meta-event
+#+BEGIN_SRC gerbil
+  (defstruct (key-signature meta-event) ())
+
+  (def-meta-event-bytes key-signature
+    displacement MI)
+
+  (def key-signature-info
+    '((7 "7 sharps" "C#" "A#")
+      (6 "6 sharps" "F#" "D#")
+      (5 "5 sharps" "B" "G#")
+      (4 "4 sharps" "E" "C#")
+      (3 "3 sharps" "A" "F#")
+      (2 "2 sharps" "D" "B")
+      (1 "1 sharp" "G" "E")
+      (0 "" "C" "A")
+      (-1 "1 flat" "F" "D")
+      (-2 "2 flats" "Bb" "G")
+      (-3 "3 flats" "Eb" "C")
+      (-4 "4 flats" "Ab" "F")
+      (-5 "5 flats" "Db" "Bb")
+      (-6 "6 flats" "Gb" "Eb")
+      (-7 "7 flats" "Cb" "Ab")))
+
+  (def (key-signature-notation ks)
+    (let (i (assoc (key-signature-displacement ks) key-signature-info eqv?))
+      (cadr i)))
+
+  (def (key-signature-note ks)
+    (let (i (assoc (key-signature-displacement ks) key-signature-info eqv?))
+      ((if (= (key-signature-MI ks) 0)
+         caddr
+         cadddr) i)))
+
+  (def (key-signature-type ks)
+    (if (= (key-signature-MI ks) 0)
+      "Major"
+      "Minor"))
+
+#+END_SRC
+
+ *FF 59 02 sf mi Key Signature*
+sf = -7: 7 flats\\
+sf = -1: 1 flat\\
+sf = 0: key of C\\
+sf = 1: 1 sharp\\
+sf = 7: 7 sharps\\
+
+mi = 0: major key\\
+mi = 1: minor key\\
+
+**** ~7F~ Sequencer Specific Meta-Event
+
+ 
+ *FF 7F len data Sequencer Specific Meta-Event*
+
+ #+NAME: sequencer-specific-meta-event
+ #+BEGIN_SRC gerbil
+   (defstruct (sequencer-specific meta-event) ())
+ #+END_SRC
+ Special requirements for particular sequencers may use this event type:
+  the first byte or bytes of data is a manufacturer ID (these are one
+  byte, or if the first byte is 00, three bytes). As with MIDI System
+  Exclusive, manufacturers who define something using this meta-event
+  should publish it so that others may be used by a sequencer which elects
+  to use this as its only file format; sequencers with their established
+  feature-specific formats should probably stick to the standard features
+  when using this format.
+
+
+
+  
+** Invalid SMF events
+
+  Note that the status bytes associated with System Common messages (0xF1 to
+  0xF6 inclusive) and System Real Time messages (0xF8 to 0xFE inclusive) are not
+  valid within a MIDI file. Generally none of these messages are relevant within
+  a MIDI file, though for the rare occasion when you do need to include one, it
+  should be embedded within a SysEx escape sequence.
+
+  The main differences between the contents of a MIDI file and a live stream of
+  MIDI data (i.e. flowing along a MIDI cable) are :
+
+  In MIDI files, all events have an associated delta time value. In a MIDI data
+  stream, events happen when they are received. System Common messages (0xF1 to
+  0xF6 inclusive) and System Real Time messages (0xF8 to 0xFE inclusive) cannot
+  normally occur within a MIDI file (though see escape sequences). As mentioned
+  above, within a MIDI file the System Reset status byte (0xFF) is used to
+  signify a Meta event, hence Meta events are only found in MIDI files. 
+
+
+
+#+NAME: invalid-event
+#+BEGIN_SRC gerbil
+  (defstruct (invalid-event event)
+   (bytes))
+#+END_SRC
+
+#+NAME: read-invalid-event
+#+BEGIN_SRC gerbil
+(def (read-invalid-event status p)
+    (def (%read-bytes)
+      (let ((next (peek-u8 p)))
+        (if (and (not (eof-object? next))
+                 (not (status-byte? next)))
+          (let ((byte (read-u8 p)))
+            (cons byte (%read-bytes)))
+          [])))
+    (let ((bytes (%read-bytes)))
+      (make-invalid-event status (list->u8vector (%read-bytes)))))
+#+END_SRC
+
+#+NAME: track-event
+#+BEGIN_SRC gerbil
+  (defstruct (invalid-event track-event)
+   (status bytes))
+
+  (def (read-unknown-track-event time status p)
+    (def (%read-bytes)
+      (let ((next (peek-u8 p)))
+        (if (and (not (eof-object? next))
+                 (not (status-byte? next)))
+          (let ((byte (read-u8 p)))
+            (cons byte (%read-bytes)))
+          [])))
+    (let ((bytes (%read-bytes)))
+      (make-unknown-track-event time status (list->u8vector (%read-bytes)))))
+
+
+  (defmethod {print unknown-track-event}
+    (lambda (self)
+      (printf "Unknown ~X ~A ~%"
+              (unknown-track-event-status self)
+              (unknown-track-event-bytes self))))
+#+END_SRC
+
+#+NAME: midi-event
+#+BEGIN_SRC gerbil
+  (defstruct (midi-event event) ())
+
+  (def (midi-event-status midi-event)
+    )(bitwise-and (event-status-byte midi-event) #xF0)
+
+  (def (midi-event-channel midi-event)
+    (bitwise-and (event-status-byte midi-event) #x0F))
+
+  (defstruct (note-off midi-event)
+    (number velocity))
+  (defstruct (note-on midi-event)
+    (number velocity))
+  (defstruct (key-aftertouch midi-event)
+    (note velocity))
+  (defstruct (control-change midi-event)
+    (controller value))
+  (defstruct (program-change midi-event)
+    (number))
+  (defstruct (channel-aftertouch midi-event)
+    (number))
+  (defstruct (pitchwheel-change midi-event)
+    (bottom top))
+
+  (def (read-midi-event status-byte p)
+    (def (two-bytes maker)
+      (let* ((one (read-u8 p)) (two (read-u8 p)))
+        (maker status-byte one two)))
+      (case  (bitwise-and status-byte #xF0)
+        ;; | 8x    | 1000xxxx | /nn vv/ | Note off (key is released)      
+        ((#x80) (two-bytes make-note-off))
+        ;; | 9x    | 1001xxxx | /nn vv/ | Note on (key is pressed)   
+        ((#x90) (two-bytes make-note-on))
+        ;; | Ax    | 1010xxxx | /nn vv/ | Key after-touch
+        ((#xA0) (two-bytes make-key-aftertouch))
+        ;; | Bx    | 1011xxxx | /cc vv/ | Control Change
+        ((#xB0) (two-bytes make-control-change))
+        ;; | Cx    | 1100xxxx | /pp/    | Program (patch) change
+        ((#xC0) (make-patch-change status-byte (read-u8)))
+        ;; | Dx    | 1101xxxx | /cc/    | Channel after-touch
+        ((#xD0) (make-channel-aftertouch status-byte (read-u8)))
+        ;; | Ex    | 1110xxxx | /bb tt/ | Pitch wheel change (2000H is normal or no change)
+        ((#xE0) (two-bytes make-pitch-wheel-change))
+        (else (error (format "Not a known midi event: #x~X" status-byte)))))
+
+  
+  (def (read-midi-event delta-time p)
+    (let* ((status (peek-u8 p))
+           (status
+            (begin (when (>= status #x80)
+                     (current-running-status (read-u8 p)))
+                   (current-running-status))))
+      (cond ((between-or-=? #x80 status #x8F)
+              (let* ((n (read-u8 p))
+                     (v (read-u8 p)))
+                (make-note-off delta-time status n v)))
+            ((between-or-=? #x90 status #x9F)
+              (let* ((n (read-u8 p))
+                     (v (read-u8 p)))
+                (make-note-on delta-time status n v)))
+            ((between-or-=? #xA0 status #xAF)
+             (let* ((n (read-u8 p))
+                    (v (read-u8 p)))
+               (make-key-aftertouch delta-time status n v)))
+            ((between-or-=? #xB0 status #xBF)
+             (let* ((n (read-u8 p))
+                    (v (read-u8 p)))
+               (make-control-change delta-time status n v)))
+            ((between-or-=? #xC0 status #xCF)
+             (let* ((pp (read-u8 p)))
+               (make-patch-change delta-time status pp)))
+             ((between-or-=? #xD0 status #xDF)
+              (let* ((cc (read-u8 p)))
+                (make-channel-aftertouch delta-time status cc)))
+              ((between-or-=? #xE0 status #xEF)
+               (let* ((bb (read-u8 p))
+                      (tt (read-u8 p)))
+                (make-pitch-wheel-change delta-time status bb tt)))
+            (else (error (format "Not a known midi event: #x~X" status))))))
+
+
+
+
+
+
+
+#+END_SRC
+* Testing Midi Files
+
+To make sure our reader works, it must be tested, and we have bug spray at the
+ready. This may also serve as a good example of how to use this library. We
+shall see.
+
+#+BEGIN_SRC gerbil
+  (import :drewc/midi/SMF-test)
+
+  (def (list-test-files (path "
+
+#+END_SRC
+#+NAME: global-test-file
+#+BEGIN_SRC gerbil
+  (def test-path "~/.gerbil/pkg/github.com/drewc/gerbil-midi/test/")
+
+
+  (def (find-test-midi-files (path test-path) (ext ".mid"))
+    (def (%fdir type f)
+      (let (t (file-info-type (file-info f)))
+        (if (equal? t type)
+          f
+          #f)))
+    (def paths (map (cut path-expand <> path) (directory-files path)))
+    (def files (filter (cut %fdir 'regular <>) paths))
+    (def directories (filter (cut %fdir 'directory <>) paths))
+
+    (apply append (filter (lambda (file) (equal? ext (path-extension file))) files)
+           (map find-test-midi-files directories)))
+
+  
+
+  (def global-test-file (car (find-midi-test-files))
+#+END_SRC
+
+#+NAME: test-SMF-file
+#+BEGIN_SRC gerbil
+  (def (test-SMF-file (file global-test-file) (print? #t))
+    (def SMF-file (read-SMF-file file))
+    (def SMF-header (SMF-file-header SMF-file))
+
+    (def (e? test e)
+      (test (MTrk-event-event e)))
+
+    ;;; We should have the same number of tracks as we were given.
+    (test> (length (SMF-file-tracks SMF-file))
+           => (header-chunk-number-of-tracks SMF-header))
+
+    ;;; I'd love to see an alien chunk in our massive collection!
+    (for ((t (SMF-file-tracks SMF-file)))
+      (test> (not (alien-chunk? t)) => #t))
+
+
+    (begin0 SMF-file
+      (printf "Midi File ~A, format ~A, ~A tracks, Sequence name ~A~%"
+              (path-strip-directory file)
+              (SMF-file-format SMF-file)
+              (SMF-file-number-of-tracks SMF-file)
+              (SMF-file-sequence-name SMF-file))
+      (for (n (in-range (SMF-file-number-of-tracks SMF-file)))
+        (let* ((track (SMF-file-track-ref SMF-file n))
+               (meta (filter (cut e? meta-event? <>)
+                             (track-chunk-events track)))
+               (sysex (filter (cut e? sysex-event? <>)
+                              (track-chunk-events track)))
+               (midi (filter (cut e? midi-event? <>)
+                             (track-chunk-events track)))
+               (invalid (filter (cut e? invalid-event? <>)
+                                (track-chunk-events track))))
+          (test> (null? invalid) =? #t
+                 "Invalid Events ~A" invalid)
+
+
+          (when print? (printf "--- Track ~A : ~A ----~%"
+                               n (track-chunk-track-name track))
+                (printf "~A Midi Events," (length midi))
+                (printf "~A Sysex Events~%" (length sysex))
+                (map print-event meta))))))
+
+#+END_SRC
+
+#+NAME: test-import
+#+BEGIN_SRC gerbil
+  (import :drewc/midi/reader 
+          :drewc/midi/chunks
+          :drewc/midi/events
+          :drewc/midi/SMF
+          :std/error
+          :gerbil/gambit/os
+          :gerbil/gambit
+          :std/iter 
+          :std/format
+          :std/sugar
+          :std/generic)
+#+END_SRC
+
+
+** Sequencer
+
+I mean. c'mon, the entire reason behind this library is to make/play a sequence
+of MIDI events. For testing, it will be fun.
+
+This is a Format 0 file, with lyrics.
+#+NAME: test-sequence 
+#+BEGIN_SRC gerbil
+  (def global-test-sequence-SMF-file "~/src/gerbil-midi/test/sultans/DIRE STRAITS.Sultans of swing K.mid")
+
+#+END_SRC
+
+
+#+NAME: test-sequence 
+#+BEGIN_SRC gerbil 
+  (def (delta-time-in-seconds delta-time microseconds-per-quarter-note ticks-per-quarter-note)
+    (let* ((seconds-per-quarter-note (/ microseconds-per-quarter-note 1000000))
+           (seconds-per-tick (/ seconds-per-quarter-note ticks-per-quarter-note)))
+      (* delta-time seconds-per-tick)))
+
+  (def (test-sequence (file global-test-sequence-SMF-file))
+    (def SMF-file (test-SMF-file file #f))
+    (def (e? test e) (test (MTrk-event-event e)))
+    (def track0 (SMF-file-track-ref SMF-file 0))
+    (def events (track-chunk-events track0))
+    (def timesig (MTrk-event-event (find (cut e? time-signature? <>) events)))
+    (def set-tempo (MTrk-event-event (find (cut e? set-tempo? <>) events)))
+
+    (for ((l events))
+      (let (wait (delta-time-in-seconds
+                  (MTrk-event-delta-time l)
+                  (set-tempo-microseconds set-tempo)
+                  (header-chunk-division (SMF-file-header SMF-file))))
+        (thread-sleep! wait)
+        (if (lyric? (MTrk-event-event l))
+          (printf "~1,5F: ~A~%" wait
+                  (text-event->string (MTrk-event-event l)))
+        
+          (printf ".")))))
+#+END_SRC
+** The REPL is useful! 
+
+#+BEGIN_SRC gerbil
+  (for ((i '(:drewc/midi/events :drewc/midi/chunks  :drewc/midi/reader  :drewc/midi/SMF :drewc/midi/SMF-test))) (eval `(reload ,i)) (eval `(import ,i)))
+#+END_SRC
+
+#+BEGIN_SRC gerbil
+(def (test-SMF-file (file global-test-file))
+   
+
+#+END_SRC
+#+BEGIN_SRC gerbil
+  (def global-test-file "~/src/gerbil-midi/test/By Joe Cocker - With A Little Help From My Friends.kar")
+#+END_SRC
+#+BEGIN_SRC gerbil
+  (def global-test-file "~/src/gerbil-midi/test/By Joe Cocker - With A Little Help From My Friends.kar")
+#+END_SRC
+
+#+BEGIN_SRC gerbil
+  (def global-test-file "/home/user/src/gerbil-midi/test/Dire Straits - Sultans Of Swing.kar")
+#+END_SRC
+
+A  ~test>~ macro will make it better.
+
+
+#+NAME: test-macro
+#+BEGIN_SRC gerbil 
+  (defrules test> ()
+    ((_ form => value format-args ...)
+     (let ((expected value)
+           (f 'form)
+           (evaled form)
+           (args (list format-args ...)))
+       (if (equal? expected evaled)
+         evaled
+         (error (apply format (if (null? args)
+                                (list "Test Failed ~A gave ~A,  != ~A" form evaled expected)
+                                (if (null? (cdr args))
+                                  (list (car args) form evaled expected)
+                                  args))))))))
+#+END_SRC
+
+** Header Chunk
+
+ Putting it all together, we have the following.
+#+NAME: test-header-chunk
+#+BEGIN_SRC gerbil
+  (def (print-header-chunk chunk)
+    (printf "Header Format ~A, ~A tracks, ~A division"
+            (header-chunk-format chunk)
+            (header-chunk-number-of-tracks chunk)
+            (header-chunk-division chunk)))
+
+  
+  (def (test-header-chunk (file global-test-file))
+    (print-header-chunk (test-read-header-chunk file))
+    (test-read-first-file-chunk file)
+    (test-second-chunk-is-track))
+
+#+END_SRC
+
+ First things first, we'll test the read on its own. We know the format must be
+ 0, 1, or 2, the type "MThd", and the length 6.
+
+#+NAME: test-header-chunk
+ #+BEGIN_SRC gerbil
+   (def (test-read-header-chunk (file global-test-file))
+     "=> header-chunk"
+     (call-with-input-file file 
+       (lambda (p)
+       (let* ((type (read-chunk-type p))
+              (length (read-chunk-length p))
+              (header (read-header-chunk type length p))
+              (format (header-chunk-format header)))
+         (begin0 header
+           (test> type => #u8(77 84 104 100))
+           (test> length => 6)
+           (test> (case format
+                    ((0 1 2) #t)
+                    (else #f))
+                  => #t "Header Format is ~A, not 0, 1 or 2" format))))))
+ #+END_SRC
+
+ Beyond that, the very first chunk in a file must be a header chunk. Since we can
+ read all chunks using one function, we'll make sure of that, and do the same tests.
+
+#+NAME: test-header-chunk
+ #+BEGIN_SRC gerbil 
+   (def (test-read-first-file-chunk (file global-test-file))
+     "=> header-chunk"
+     (let (chunk (call-with-input-file file read-chunk))
+           (begin0 chunk 
+             (test> (header-chunk? chunk) => #t)  
+             (test> (chunk-type->string chunk) => "MThd")
+             (test> (chunk-length chunk) => 6)
+             (test> (case (header-chunk-format chunk)
+                      ((0 1 2) #t)
+                      (else #f))
+                    => #t
+                    "Header Format is ~A, not 0, 1 or 2" (header-chunk-format chunk)))))
+ #+END_SRC
+
+Finally, for all MIDI files, the second chunk should start with "MTrk".
+
+#+NAME: test-header-chunk
+#+BEGIN_SRC gerbil
+  (def (test-second-chunk-is-track (file global-test-file))
+    "=> \"MTrk\" "
+    (call-with-input-file file
+      (lambda (p)
+        (read-chunk p)
+        (let (label 
+               (bytes->string
+                (list->u8vector (for/collect ((_ (in-range 4)))
+                                  (read-u8 p)))))
+          (begin0 label
+            (test> label => "MTrk"))))))
+#+END_SRC
+
+
+** Track Chunks
+
+#+NAME: test-read-chunks
+#+BEGIN_SRC gerbil 
+  (def (test-read-chunks (file global-test-file))
+      "=> track-chunk"
+      (call-with-input-file file
+        (lambda (p)
+          (printf "Testing File ~A " file)
+          ;; header
+          (print-header-chunk (read-chunk p))
+          ;; first track
+          (read-chunks p))))
+#+END_SRC
+
+** Aliens!
+#+BEGIN_SRC gerbil
+  (def (test-read-first-and-second-chunks-as-aliens (file "~/src/gerbil-midi/test/MIDI_sample.mid"))
+    (call-with-input-file file
+      (lambda (p)
+        (let* ((type (read-chunk-type p))
+               (length (read-chunk-length p))
+               (header-chunk (read-alien-chunk type length p))
+               (type (read-chunk-type p))
+               (length (read-chunk-length p))
+               (track-chunk (read-alien-chunk type length p)))
+
+          ;; The first is always a header chunk of length 6
+          (test> (chunk-type->string header-chunk) => "MThd")
+          (test> (chunk-length header-chunk) => 6)
+          (test> (u8vector-length (alien-chunk-bytes header-chunk))
+                 => (chunk-length header-chunk))
+
+
+          (test> (chunk-type->string track-chunk) => "MTrk")
+          (test> (u8vector-length (alien-chunk-bytes track-chunk))
+                 => (chunk-length track-chunk))
+
+          (cons header-chunk track-chunk)))))
+#+END_SRC
+
+** Events 
+
+We'll print info out so we know what they are.
+#+NAME: print-events
+#+BEGIN_SRC gerbil 
+  (def (print-event event (nl #t))
+    (begin0 event
+      (try
+       {print event}
+       (catch (e) (display-exception e)))
+      (when (midi-event? event) (set! nl #t))
+      (when nl (printf "~%"))))
+
+#+END_SRC
+
+  
+*** MTrk events
+
+  All events in a MIDI file are wrapped in an MTrk event.
+
+#+NAME: print-events
+#+BEGIN_SRC gerbil
+  (def (print-MTrk-event e)
+   (printf "T:~A " (MTrk-event-delta-time e))
+   (print-event (MTrk-event-event e) #f))
+  (defmethod {print MTrk-event}
+    (lambda (self) (print-MTrk-event self)))
+#+END_SRC
+*** Meta Events
+
+Meta events usually come first.
+ 
+Ideally, there is no unknown-meta-event. If there is one, we print it with the
+type and the length.
+
+
+
+#+NAME: print-events
+#+BEGIN_SRC gerbil
+  (def (print-unknown-meta-event e)
+    (printf "Meta? #x~X length ~A"
+            (meta-event-type e)
+            (meta-event-length e)))
+
+  (defmethod {print unknown-meta-event} (lambda (e) (print-unknown-meta-event e)))
+#+END_SRC
+
+**** Time Signature 
+
+#+NAME: print-events
+#+BEGIN_SRC gerbil
+  (def (print-time-signature self)
+    (printf "Time Signature: ~A/~A ~A MIDI clocks per dotted-quarter, ~A notated 32nd-notes per quarter-note.~%"
+
+              (time-signature-beats self)
+              (time-signature-bars self)
+              (time-signature-pulses-per-quarter self)
+              (time-signature-32nd-per-click self)))
+
+  (defmethod {print time-signature}
+    (lambda (self) (print-time-signature self)))
+#+END_SRC
+
+**** Key Signature 
+
+#+NAME: print-events
+#+BEGIN_SRC gerbil
+  (def (print-key-signature self)
+    (printf "Key Signature: ~A ~A"
+            (key-signature-note self)
+            (key-signature-type self)))
+
+  (defmethod {print key-signature}
+    (lambda (self) (print-key-signature self)))
+#+END_SRC
+
+**** Set Tempo 
+
+#+NAME: print-events
+ #+BEGIN_SRC gerbil
+  (def (print-set-tempo self)
+    (printf "Set Tempo: ~1,1Fbpm ~Amu (microseconds) per quarter-note." 
+            (/ 60000000 (set-tempo-microseconds self))
+            (set-tempo-microseconds self)))
+
+  (defmethod {print set-tempo}
+    (lambda (self) (print-set-tempo self)))
+
+ #+END_SRC
+
+**** Sequencer Specific 
+
+#+NAME: print-events
+#+BEGIN_SRC gerbil
+  (def (print-sequencer-specific self)
+    (printf "Sequencer Specific Length ~A"
+            (meta-event-length self)))
+
+  (defmethod {print sequencer-specific}
+    (lambda (self) (print-sequencer-specific self)))
+#+END_SRC
+
+**** End of Track
+
+#+NAME: print-events
+#+BEGIN_SRC gerbil
+  (def (print-end-of-track e)
+    (printf "End of Track"))
+
+  (defmethod {print end-of-track} (cut print-end-of-track <>))
+
+#+END_SRC
+**** Text Events 
+
+
+#+NAME: print-events
+#+BEGIN_SRC gerbil
+  (def (print-text-event e)
+    (printf "~A ~A: ~A"
+            (type-of e)
+            (text-event-description e) (text-event->string e)))
+
+  (defmethod {print text-event}
+    (lambda (e) (print-text-event e)))
+  (defmethod {print unknown-text-event}
+    (lambda (e) (printf "Unknown: ~X"
+                   (meta-event-type e))
+       (print-text-event e)))
+
+  (def (print-track-name e)
+    (printf "Track Name: ~A" (text-event->string e)))
+
+  (defmethod {print track-name} (cut print-track-name <>))
+#+END_SRC
+*** Midi Events
+#+NAME: print-events
+#+BEGIN_SRC gerbil
+    (def (print-control-change self)
+      (printf "Control Change: ~A ~A~%"
+              (control-change-controller self)
+              (control-change-value self)))
+    (defmethod {print control-change}
+        (lambda (self) (print-control-change self)))
+
+
+  (defmethod {print midi-event}
+      (lambda (self) 
+        (printf "Channel ~A " (midi-event-channel self))))
+
+  (defmethod {print note-off}
+    (lambda (self)
+      (@next-method self)
+      (printf "Note OFF ~A velocity ~A"
+              (note-off-number self)
+              (note-off-velocity self))))
+
+
+  (defmethod {print note-on}
+    (lambda (self) 
+      (@next-method self)
+      (printf "Note ON ~A velocity ~A"
+              (note-on-number self)
+              (note-on-velocity self))))
+
+
+  (defmethod {print program-change}
+    (lambda (self) (printf "Patch (Program) Change: ~A" 
+                      (program-change-number self))))
+
+
+
+  (defmethod {print channel-aftertouch}
+    (lambda (self) (printf "Channel After Touch ~A"
+                      (channel-aftertouch-number self))))
+
+
+
+  (defmethod {print pitchwheel-change}
+    (lambda (self) (printf "pitchwheel change bottom ~A top ~A"
+                      (pitchwheel-change-bottom self)
+                      (pitchwheel-change-top self))))
+#+END_SRC
+
+* Gerbil Files
+
+** midi/chunks.ss
+
+#+BEGIN_SRC gerbil :tangle "midi/chunks.ss" :noweb yes
+  (import
+    :drewc/midi/events
+    :gerbil/gambit
+    :gerbil/gambit/ports
+    :scheme/base
+    :std/iter
+    :std/format
+    :std/generic)
+
+  (export #t)
+
+  <<chunk-struct>>
+  
+  <<alien-chunk>>
+
+  <<header-chunk>>
+
+  <<track-chunk>>
+
+  <<track-chunk-track-name>>
+#+END_SRC
+
+** midi/events.ss
+
+#+BEGIN_SRC gerbil :tangle midi/events.ss :noweb yes
+  (import
+        :gerbil/gambit
+        :gerbil/gambit/ports
+        :scheme/base
+        :std/iter
+        (phi: +1 :std/iter :std/format)
+        :std/format
+        :std/generic)
+  (export #t)
+
+  <<MTrk-event>>
+
+  <<event-struct>>
+
+  <<invalid-event>>
+
+  <<sysex-event>>
+
+  <<midi-events>>
+
+  <<meta-event>>
+
+  <<unknown-meta-event>>
+
+  <<text-meta-event>>
+
+  <<track-name-meta-event>>
+
+  <<time-signature-meta-event>>
+  
+  <<key-signature-meta-event>>
+   
+  <<set-tempo-meta-event>>
+
+  <<lyric-meta-event>>
+  
+  <<end-of-track-meta-event>>
+
+  <<sequencer-specific-meta-event>>
+
+#+END_SRC
+
+** midi/reader.ss
+#+BEGIN_SRC gerbil :tangle "midi/reader.ss" :noweb yes
+  (import
+      :gerbil/gambit
+      :gerbil/gambit/ports
+      :scheme/base
+      :std/iter
+      :std/format
+      :std/generic
+      :drewc/midi/chunks
+      :drewc/midi/events)
+
+  (export read-chunk-length
+          read-chunk-type
+          read-header-chunk
+          read-chunk
+          read-chunks
+          read-MTrk-event
+          read-meta-event)
+
+  <<read-variable-length-quantity>>
+
+  <<big-endian>>
+
+  <<read-chunk-length-and-type>>
+
+  <<read-chunk>>
+
+  <<read-alien-chunk>>
+
+  <<read-header-chunk>>
+
+  <<read-track-chunk>>
+
+  <<read-delta-time>>
+
+  <<read-MTrk-events>>
+
+  <<status-byte?>>
+
+  <<current-running-status>>
+
+  <<read-event>>
+
+  <<read-invalid-event>>
+
+  <<midi-status-byte?>>
+
+  <<read-midi-event>>
+
+  <<read-meta-event>>
+
+  <<read-sysex-event>>
+
+
+#+END_SRC
+
+** midi/SMF.ss
+
+#+BEGIN_SRC gerbil :noweb yes :tangle "midi/SMF.ss"
+  (import :drewc/midi/chunks
+          :drewc/midi/events
+          :drewc/midi/reader
+          
+          :std/iter
+          :gerbil/gambit/ports)
+
+  (export #t)
+
+  <<midi-file-struct>>
+
+  <<SMF-file-sequence-name>>
+
+#+END_SRC
+
+** midi.ss
+
+#+BEGIN_SRC gerbil :tangle midi.ss :noweb yes
+  (import :drewc/midi/reader 
+          :drewc/midi/chunks
+          :drewc/midi/events
+          :drewc/midi/SMF)
+
+  (export
+    (import: :drewc/midi/chunks)
+    (import: :drewc/midi/events)
+    (import: :drewc/midi/SMF))
+#+END_SRC
+
+** midi/SMF-test.ss
+
+#+BEGIN_SRC gerbil :tangle midi/SMF-test.ss :noweb yes
+  <<test-import>>
+  (export #t)
+  <<test-macro>>
+
+  <<global-test-file>>
+
+  <<test-header-chunk>>
+
+  <<print-events>>
+
+  <<test-read-chunks>>
+
+  <<test-SMF-file>>
+
+  <<test-sequence>>
+
+
+#+END_SRC
